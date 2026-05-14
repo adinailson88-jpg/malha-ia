@@ -1,0 +1,51 @@
+# ============================================================================
+# Malha IA v4.0.1 — Backup cloud (GitHub Actions, gratuito)
+# ----------------------------------------------------------------------------
+# Use isto APENAS se quiser execucao 24/7 sem manter o PC ligado.
+# Setup resumido (ver LEIA-ME.txt secao GITHUB ACTIONS):
+#   1) Crie um repo PRIVADO no GitHub e faca push do motor_v36.py
+#   2) Va em Settings - Secrets and variables - Actions, e adicione:
+#        AUTENTICACAO_GOOGLE   (conteudo do autenticacao_google.json em base64)
+#        CHAVES_API            (opcional, conteudo do chaves_api.json em base64)
+#   3) Salve este arquivo em .github/workflows/malha_ia_ciclo.yml
+#   4) Habilite o workflow em Actions
+# ----------------------------------------------------------------------------
+name: Malha IA - Ciclo Periodico
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # a cada 15 minutos
+  workflow_dispatch:          # permite trigger manual
+
+jobs:
+  ciclo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r execucao_offline/requirements.txt
+
+      - name: Reconstruir credenciais Google a partir dos Secrets
+        env:
+          AUTENTICACAO_GOOGLE: ${{ secrets.AUTENTICACAO_GOOGLE }}
+          CHAVES_API: ${{ secrets.CHAVES_API }}
+        run: |
+          echo "$AUTENTICACAO_GOOGLE" | base64 -d > autenticacao_google.json
+          echo "$CHAVES_API" | base64 -d > chaves_api.json || echo "{}" > chaves_api.json
+
+      - name: Executar um ciclo do motor
+        env:
+          MOTOR_MAX_CICLOS: '1'
+        run: python motor_v36.py --ciclo-unico
