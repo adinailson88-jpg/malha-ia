@@ -20,7 +20,7 @@ on:
 jobs:
   ciclo:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
 
     steps:
       - name: Checkout do codigo
