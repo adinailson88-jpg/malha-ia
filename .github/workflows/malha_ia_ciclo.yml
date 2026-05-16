@@ -1,21 +1,22 @@
 # ============================================================================
-# Malha IA v4.0.1 — Backup cloud (GitHub Actions, gratuito)
+# Malha IA v4.0.3 — Backup cloud (GitHub Actions, gratuito)
 # ----------------------------------------------------------------------------
-# Use isto APENAS se quiser execucao 24/7 sem manter o PC ligado.
-# Setup resumido (ver LEIA-ME.txt secao GITHUB ACTIONS):
-#   1) Crie um repo PRIVADO no GitHub e faca push do motor_v36.py
-#   2) Va em Settings - Secrets and variables - Actions, e adicione:
-#        AUTENTICACAO_GOOGLE   (conteudo do autenticacao_google.json em base64)
-#        CHAVES_API            (opcional, conteudo do chaves_api.json em base64)
-#   3) Salve este arquivo em .github/workflows/malha_ia_ciclo.yml
-#   4) Habilite o workflow em Actions
+# Concurrency: garante que SÓ 1 execução roda por vez. Se um cron dispara
+# enquanto outro ainda está rodando, o novo entra na fila em vez de
+# executar em paralelo (evita conflito de escrita no Google Sheets).
+# Cron a cada 1h: cada ciclo pode demorar 25-30 min com previsão completa,
+# então 1×/h faz mais sentido que 4×/h (que empilharia execuções).
 # ----------------------------------------------------------------------------
 name: Malha IA - Ciclo Periodico
 
+concurrency:
+  group: malha-ia-ciclo
+  cancel-in-progress: false
+
 on:
   schedule:
-    - cron: '*/15 * * * *'   # a cada 15 minutos
-  workflow_dispatch:          # permite trigger manual
+    - cron: '0 * * * *'       # a cada 1 hora (no minuto :00)
+  workflow_dispatch:           # permite trigger manual
 
 jobs:
   ciclo:
