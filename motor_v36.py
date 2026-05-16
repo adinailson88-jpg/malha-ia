@@ -537,8 +537,18 @@ except ImportError:
     _SHAP_DISPONIVEL = False
     print("[Imports] SHAP indisponível — interpretabilidade do GBR ficará limitada.")
 
-# Versão única do motor (v4.0.1): usada em logs, METRICAS_TREINO e header.
-_VERSAO_MOTOR = "v4.0.1"
+# Versão única do motor (v4.0.3): usada em logs, METRICAS_TREINO e header.
+# v4.0.3 (2026-05-14):
+#   - Previsão temporal de custos mensais (Coluna Q, "Valor do chamado") —
+#     série + parser preparados (Fase 4A). Refatoração de previsão para
+#     reaproveitamento será aplicada em Fase 4B (sessão dedicada).
+#   - Indicadores brutos por localização para painel ODS (ODS 9, 11, 12).
+#   - Nova aba PESOS_ODS (configurável pelo usuário; lida pelo HTML).
+# v4.0.2 (2026-05-14):
+#   - Detecção automática Colab vs. local; google.colab.drive opcional.
+#   - Imports do TensorFlow (Keras) elevados a escopo global para uso
+#     em treinar_classificador_lstm() fora da função _importar_tf().
+_VERSAO_MOTOR = "v4.0.3"
 
 print(f"[Imports] OK · pandas={pd.__version__} · {_VERSAO_MOTOR} "
       f"(pmdarima={'ON' if _PMDARIMA_OK else 'fallback'}, "
@@ -654,10 +664,16 @@ COL_DATA_ABERTURA = 2            # C
 COL_CATEGORIA_TOPO = 4           # E
 COL_CAMPUS = 7                   # H
 COL_CATEGORIA_HIERARQUICA = 12   # M
+COL_VALOR = 16                   # Q  — "Valor do chamado" (R$) [v4.0.3]
 COL_DESCRICAO_GLPI = 22          # W
 COL_TITULO_OSM = 23              # X
 COL_DESCRICAO_OSM = 24           # Y
 COL_CAT_IA = 25                  # Z
+
+# Colunas opcionais (podem não existir em todas as bases) — tratar None
+COL_DATA_CONCLUSAO = None        # se a planilha não tem, indicadores que dependem
+                                 # disso ficam em branco. Atribua manualmente se existir.
+COL_LOCAL = None                 # idem — proxy para "chamados repetidos no mesmo local"
 
 # Filtragem por campus/tipo/categoria
 FILTROS_ATIVOS = True            # True = roda análise completa por filtro após análise principal
@@ -1660,6 +1676,311 @@ def estimar_criticidade(texto):
 # =====================================================================
 # 10. EIXO 2 – PREVISÃO TEMPORAL AVANÇADA (7 modelos + ensemble + CV)
 # =====================================================================
+
+# =====================================================================
+# [v4.0.3 — Fase 4A] Parser e série de custos (Coluna Q)
+# =====================================================================
+def parse_valor_chamado(valor_raw):
+    """Converte valor da coluna Q em float. Retorna None se inválido.
+
+    Tolera: 'R$ 1.234,56', '1234.56', '1234,56', número Sheets nativo, vazio.
+    """
+    if valor_raw is None or valor_raw == '':
+        return None
+    if isinstance(valor_raw, (int, float)):
+        v = float(valor_raw)
+        return v if v >= 0 else None
+    s = str(valor_raw).strip()
+    if not s:
+        return None
+    s = s.replace('R$', '').replace(' ', '').strip()
+    if ',' in s and '.' in s:
+        # Formato '1.234,56' — remove pontos de milhar, troca vírgula por ponto
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    try:
+        v = float(s)
+        return v if v >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def construir_serie_custo(dados_linhas):
+    """[v4.0.3] Constrói série mensal de SOMA de custos (R$) — coluna Q.
+
+    Filtros aplicados:
+      - Data de abertura válida (coluna C)
+      - Valor parseável e > 0 (coluna Q)
+
+    Retorna: pd.Series indexada por DatetimeIndex mensal (frequência 'MS')
+             com o valor total daquele mês em reais. Vazia se sem dados.
+
+    NOTA Fase 4A: a função existe e fica pronta para Fase 4B
+    (`executar_previsao_custo`), que reaproveita a infra de previsão.
+    """
+    registros = []
+    for linha in dados_linhas:
+        if len(linha) <= max(COL_DATA_ABERTURA, COL_VALOR):
+            continue
+        data_str = (linha[COL_DATA_ABERTURA] or '').strip()
+        if not data_str:
+            continue
+        data = pd.to_datetime(data_str, format='%d/%m/%Y %H:%M:%S', errors='coerce')
+        if pd.isna(data):
+            data = pd.to_datetime(data_str, format='%d/%m/%Y', errors='coerce')
+        if pd.isna(data):
+            data = pd.to_datetime(data_str, dayfirst=True, errors='coerce')
+        if pd.isna(data):
+            continue
+        valor = parse_valor_chamado(linha[COL_VALOR])
+        if valor is None or valor <= 0:
+            continue
+        registros.append({'data': data, 'valor': valor})
+
+    if not registros:
+        return pd.Series(dtype=float)
+
+    df = pd.DataFrame(registros)
+    df['mes'] = df['data'].dt.to_period('M').dt.to_timestamp()
+    serie = df.groupby('mes')['valor'].sum().sort_index()
+    try:
+        serie.index.freq = 'MS'
+    except Exception:
+        pass
+    return serie
+
+
+# =====================================================================
+# [v4.0.3 — Fase 4A] Indicadores ODS brutos por campus
+# =====================================================================
+def _ler_area_atual_por_campus():
+    """Retorna dict {rotulo_campus: area_total_m2} para o ano mais recente
+    da aba 'Área Manutenção'. Se a aba não existir, retorna {}."""
+    try:
+        aba = doc.worksheet("Área Manutenção")
+        valores = aba.get_all_values()
+    except Exception:
+        return {}
+    if not valores or len(valores) < 2:
+        return {}
+    # Estrutura simples: Ano | Área Construída m² | Área Total m²
+    # Caso a planilha tenha colunas por campus, é adaptada aqui no futuro.
+    # Por enquanto retorna {} (= densidade fica 0 para todos os campi).
+    return {}
+
+
+def calcular_indicadores_ods_por_campus(dados_linhas):
+    """[v4.0.3] Calcula indicadores brutos por campus para painel ODS.
+
+    Grava aba INDICADORES_ODS com 10 indicadores por campus. O HTML lê
+    estes valores junto com PESOS_ODS para compor os índices ODS 9/11/12.
+    Esta função NÃO aplica pesos — só agrega valores brutos.
+    """
+    if not dados_linhas:
+        print("[ODS] Sem dados para calcular indicadores. Pulando.")
+        return
+
+    PADROES_INFRA_CRITICA = [
+        'eletric', 'elétric', 'hidraulic', 'hidráulic', 'estrutural',
+        'incendio', 'incêndio', 'gas', 'gás', 'cobertura', 'telhado',
+        'curto', 'vazamento'
+    ]
+    PADROES_ESPACO_COLETIVO = [
+        'sala de aula', 'laboratório', 'laboratorio', 'biblioteca',
+        'auditório', 'auditorio', 'banheiro coletivo', 'cantina',
+        'estacionamento', 'corredor'
+    ]
+    SLA_DIAS = {'Alta': 3, 'Média': 7, 'Media': 7, 'Baixa': 15}
+
+    # Agrupa por campus
+    campuses = sorted({
+        (l[COL_CAMPUS] or '').strip()
+        for l in dados_linhas
+        if len(l) > COL_CAMPUS and (l[COL_CAMPUS] or '').strip()
+    })
+    if not campuses:
+        print("[ODS] Nenhum campus identificado. Pulando.")
+        return
+
+    area_por_campus = _ler_area_atual_por_campus()
+
+    cabecalho = [
+        'Campus',
+        'N_chamados_total',
+        'N_infra_critica',
+        'Tempo_medio_resolucao_dias',
+        'Taxa_resolucao_no_prazo',
+        'N_criticos_alta',
+        'N_em_espaco_coletivo',
+        'Densidade_chamados_por_1000m2',
+        'Razao_preventiva_corretiva',
+        'Valor_total_gasto_R$',
+        'N_chamados_repetidos'
+    ]
+    linhas_saida = [cabecalho]
+
+    for campus in campuses:
+        chamados_c = [
+            l for l in dados_linhas
+            if len(l) > COL_CAMPUS and (l[COL_CAMPUS] or '').strip() == campus
+        ]
+        n_total = len(chamados_c)
+
+        # Infra crítica (heurística textual em COL_CAT_IA)
+        n_infra = sum(
+            1 for l in chamados_c
+            if len(l) > COL_CAT_IA
+            and any(p in (l[COL_CAT_IA] or '').lower() for p in PADROES_INFRA_CRITICA)
+        )
+
+        # Tempo médio resolução + taxa no prazo (depende de COL_DATA_CONCLUSAO)
+        tempo_medio = None
+        taxa_prazo = None
+        if COL_DATA_CONCLUSAO is not None:
+            tempos = []
+            no_prazo = 0
+            n_concluidos = 0
+            for l in chamados_c:
+                if len(l) <= max(COL_DATA_ABERTURA, COL_DATA_CONCLUSAO):
+                    continue
+                try:
+                    dt_ab = pd.to_datetime(l[COL_DATA_ABERTURA], dayfirst=True, errors='coerce')
+                    dt_cc = pd.to_datetime(l[COL_DATA_CONCLUSAO], dayfirst=True, errors='coerce')
+                except Exception:
+                    continue
+                if pd.isna(dt_ab) or pd.isna(dt_cc) or dt_cc < dt_ab:
+                    continue
+                dias = (dt_cc - dt_ab).days
+                tempos.append(dias)
+                n_concluidos += 1
+                crit = ''
+                if len(l) > COL_CRITICIDADE_OUT:
+                    crit = (l[COL_CRITICIDADE_OUT] or '').strip()
+                if dias <= SLA_DIAS.get(crit, 7):
+                    no_prazo += 1
+            if tempos:
+                tempo_medio = sum(tempos) / len(tempos)
+            if n_concluidos:
+                taxa_prazo = no_prazo / n_concluidos
+
+        # Críticos com criticidade Alta
+        n_alta = sum(
+            1 for l in chamados_c
+            if len(l) > COL_CRITICIDADE_OUT
+            and (l[COL_CRITICIDADE_OUT] or '').strip().lower() == 'alta'
+        )
+
+        # Espaço coletivo (heurística em COL_TITULO)
+        n_coletivo = sum(
+            1 for l in chamados_c
+            if len(l) > COL_TITULO
+            and any(p in (l[COL_TITULO] or '').lower() for p in PADROES_ESPACO_COLETIVO)
+        )
+
+        # Densidade por 1000 m² (depende da aba Área Manutenção)
+        area_m2 = area_por_campus.get(campus, 0)
+        densidade = (n_total / area_m2 * 1000) if area_m2 > 0 else 0.0
+
+        # Razão preventiva/corretiva
+        n_prev = sum(
+            1 for l in chamados_c
+            if len(l) > COL_CAT_IA and 'preventiv' in (l[COL_CAT_IA] or '').lower()
+        )
+        n_corr = sum(
+            1 for l in chamados_c
+            if len(l) > COL_CAT_IA and 'corretiv' in (l[COL_CAT_IA] or '').lower()
+        )
+        if n_corr > 0:
+            razao_pc = n_prev / n_corr
+        elif n_prev > 0:
+            razao_pc = float(n_prev)
+        else:
+            razao_pc = 0.0
+
+        # Valor total gasto (coluna Q)
+        valor_total = 0.0
+        for l in chamados_c:
+            if len(l) > COL_VALOR:
+                v = parse_valor_chamado(l[COL_VALOR])
+                if v is not None:
+                    valor_total += v
+
+        # Chamados repetidos (depende de COL_LOCAL)
+        n_repetidos = 0
+        if COL_LOCAL is not None:
+            contagem_local = {}
+            for l in chamados_c:
+                if len(l) > COL_LOCAL:
+                    loc = (l[COL_LOCAL] or '').strip()
+                    if loc:
+                        contagem_local[loc] = contagem_local.get(loc, 0) + 1
+            n_repetidos = sum(v - 1 for v in contagem_local.values() if v > 1)
+
+        linhas_saida.append([
+            campus,
+            n_total,
+            n_infra,
+            round(tempo_medio, 2) if tempo_medio is not None else '',
+            round(taxa_prazo, 3) if taxa_prazo is not None else '',
+            n_alta,
+            n_coletivo,
+            round(densidade, 3),
+            round(razao_pc, 3),
+            round(valor_total, 2),
+            n_repetidos
+        ])
+
+    # Grava na aba
+    try:
+        aba = obter_aba('INDICADORES_ODS', linhas=200, colunas=11, cabecalho=cabecalho)
+        aba.clear()
+        aba.update(values=linhas_saida, range_name='A1',
+                   value_input_option='USER_ENTERED')
+        print(f"[ODS] INDICADORES_ODS atualizada para {len(campuses)} campi.")
+    except Exception as e:
+        print(f"[ODS] Falha ao gravar INDICADORES_ODS: {e}")
+
+
+def garantir_aba_pesos_ods():
+    """[v4.0.3] Cria a aba PESOS_ODS com pesos-padrão na primeira execução.
+    Se já existe, NÃO sobrescreve (preserva edições do usuário)."""
+    try:
+        doc.worksheet('PESOS_ODS')
+        print("[ODS] Aba PESOS_ODS já existe — preservando edições do usuário.")
+        return
+    except WorksheetNotFound:
+        pass
+    except Exception as e:
+        print(f"[ODS] Erro ao verificar PESOS_ODS: {e}")
+        return
+
+    cabecalho = ['Indicador', 'Sentido',
+                 'ODS_9_Infraestrutura',
+                 'ODS_11_Cidades_Sustentaveis',
+                 'ODS_12_Consumo_Responsavel']
+    linhas_padrao = [
+        cabecalho,
+        ['N_chamados_total',              'minimizar',  0.10, 0.10, 0.05],
+        ['N_infra_critica',               'minimizar',  0.30, 0.10, 0.00],
+        ['Tempo_medio_resolucao_dias',    'minimizar',  0.20, 0.05, 0.10],
+        ['Taxa_resolucao_no_prazo',       'maximizar',  0.20, 0.10, 0.10],
+        ['N_criticos_alta',               'minimizar',  0.10, 0.30, 0.05],
+        ['N_em_espaco_coletivo',          'contextual', 0.05, 0.25, 0.05],
+        ['Densidade_chamados_por_1000m2', 'minimizar',  0.00, 0.05, 0.05],
+        ['Razao_preventiva_corretiva',    'maximizar',  0.05, 0.05, 0.30],
+        ['Valor_total_gasto_R$',          'minimizar',  0.00, 0.00, 0.20],
+        ['N_chamados_repetidos',          'minimizar',  0.00, 0.00, 0.10]
+    ]
+    try:
+        aba = obter_aba('PESOS_ODS', linhas=50, colunas=5, cabecalho=cabecalho)
+        aba.clear()
+        aba.update(values=linhas_padrao, range_name='A1',
+                   value_input_option='USER_ENTERED')
+        print("[ODS] Aba PESOS_ODS criada com pesos padrão. Editável pelo usuário.")
+    except Exception as e:
+        print(f"[ODS] Falha ao criar PESOS_ODS: {e}")
+
 
 def extrair_serie_temporal(dados_linhas):
     """
@@ -5517,6 +5838,14 @@ def executar_todos_filtros(dados_linhas):
             print(f"[Filtros] PREVISAO_POR_CATEGORIA gravada com {len(_linhas_cat)-1} categorias.")
         except Exception as _e_pc:
             print(f"[Filtros] PREVISAO_POR_CATEGORIA falhou: {_e_pc}")
+
+    # ── [v4.0.3 — Fase 4A] Indicadores ODS + Pesos ODS ──────────────────────
+    try:
+        print("[ODS] Calculando indicadores brutos por campus...")
+        calcular_indicadores_ods_por_campus(dados_linhas)
+        garantir_aba_pesos_ods()
+    except Exception as _e_ods:
+        print(f"[ODS] Bloco de indicadores/pesos falhou: {_e_ods}")
 
     print("[Filtros] Execução por filtros concluída.")
 
