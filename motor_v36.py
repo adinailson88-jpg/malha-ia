@@ -537,7 +537,15 @@ except ImportError:
     _SHAP_DISPONIVEL = False
     print("[Imports] SHAP indisponível — interpretabilidade do GBR ficará limitada.")
 
-# Versão única do motor (v4.0.4): usada em logs, METRICAS_TREINO e header.
+# Versão única do motor (v4.0.5): usada em logs, METRICAS_TREINO e header.
+# v4.0.5 (2026-05-14):
+#   - Novo modo `reclassificacao`: reavalia chamados já classificados
+#     com baixa confiança (< LIMIAR_RECLASSIFICACAO) usando o LSTM atual
+#     (mais treinado) e os 4 campos textuais (B + W + X + Y).
+#   - Respeita coluna AF (CONFERENCIA): se TRUE, motor NUNCA sobrescreve
+#     — preserva revisão humana.
+#   - Só sobrescreve se nova confiança > antiga + DELTA_MELHORIA_MINIMA.
+#   - Workflow GitHub Actions dedicado roda 1× por dia.
 # v4.0.4 (2026-05-14):
 #   - Suporte a execução por MODO via env var MOTOR_MODO ou flag CLI:
 #       * classificacao      → só LSTM + 1 lote (rápido, 15min)
@@ -556,7 +564,7 @@ except ImportError:
 #   - Detecção automática Colab vs. local; google.colab.drive opcional.
 #   - Imports do TensorFlow (Keras) elevados a escopo global para uso
 #     em treinar_classificador_lstm() fora da função _importar_tf().
-_VERSAO_MOTOR = "v4.0.4"
+_VERSAO_MOTOR = "v4.0.5"
 
 print(f"[Imports] OK · pandas={pd.__version__} · {_VERSAO_MOTOR} "
       f"(pmdarima={'ON' if _PMDARIMA_OK else 'fallback'}, "
@@ -690,6 +698,13 @@ COL_CAT_IA_OUT = 26              # Z
 COL_AVALIACAO_OUT = 28           # AB
 COL_EXECUTOR_OUT = 29            # AC
 COL_CRITICIDADE_OUT = 30         # AD
+COL_CONFERENCIA = 31             # AF — caixa de seleção [v4.0.5]
+                                  # TRUE = revisado pelo usuário; motor não sobrescreve.
+
+# Reclassificação (v4.0.5)
+LIMIAR_RECLASSIFICACAO = 0.80    # reavalia tudo com confiança < 80%
+DELTA_MELHORIA_MINIMA = 0.05     # só sobrescreve se nova_conf > antiga + 5pp
+LOTE_RECLASSIFICACAO = 200       # máx. de chamados por execução
 
 try:
     doc = gc.open(NOME_PLANILHA)
@@ -6137,6 +6152,137 @@ def _modo_previsao_filtros():
     executar_todos_filtros(dados_op, executar_ods=False)
 
 
+def _modo_reclassificacao():
+    """[v4.0.5] Reavalia chamados classificados com baixa confiança usando
+    LSTM atual (já mais treinado) e os 4 campos textuais (B+W+X+Y).
+
+    Critério de seleção:
+      - COL_CAT_IA_OUT preenchida (já classificado)
+      - confiança < LIMIAR_RECLASSIFICACAO (default 0.80)
+      - COL_CONFERENCIA (AF) != TRUE (preserva revisão humana)
+
+    Critério de sobrescrita:
+      - nova_confianca > confianca_antiga + DELTA_MELHORIA_MINIMA
+      - OU categoria mudou e nova_confianca >= LIMIAR_RECLASSIFICACAO
+
+    Loga cada mudança em LOG_CLASSIFICACAO com origem 'Reclassificacao_LSTM'.
+    """
+    try:
+        todas_linhas = planilha.get_all_values()
+    except APIError as e:
+        print(f"[Modo reclassificacao] Falha ao ler planilha: {e}")
+        return
+    dados_op = todas_linhas[1:]
+    atualizar_categorias(dados_op)
+
+    # Treina/recarrega o classificador (precisa estar atualizado)
+    df_treino = carregar_dados_rotulados(dados_op)
+    pipeline, _ = (treinar_classificador_lstm(df_treino)
+                   if df_treino is not None else (None, None))
+    if pipeline is None:
+        print("[Modo reclassificacao] Sem classificador disponível. Encerrando.")
+        return
+    _eh_lstm = isinstance(pipeline, LSTMClassifier)
+    nome_origem = "Reclassificacao_LSTM" if _eh_lstm else "Reclassificacao_RF"
+    print(f"[Modo reclassificacao] Classificador: "
+          f"{'LSTM' if _eh_lstm else 'RF'} | "
+          f"Limiar={LIMIAR_RECLASSIFICACAO} | Delta={DELTA_MELHORIA_MINIMA}")
+
+    # Identifica candidatos: classificado + baixa confiança + sem conferência
+    candidatos = []
+    for i, linha in enumerate(todas_linhas):
+        if i == 0:
+            continue
+        if len(linha) <= COL_AVALIACAO_OUT:
+            continue
+        cat_atual = (linha[COL_CAT_IA_OUT] or '').strip() if len(linha) > COL_CAT_IA_OUT else ''
+        if not cat_atual:
+            continue  # ainda não classificado — workflow 1 cuida
+        # Respeita conferência humana (caixa de seleção AF)
+        conf_marcada = ''
+        if len(linha) > COL_CONFERENCIA:
+            conf_marcada = (linha[COL_CONFERENCIA] or '').strip().upper()
+        if conf_marcada in ('TRUE', 'VERDADEIRO', '1', 'SIM'):
+            continue
+        # Lê confiança antiga (string '0.85' → float)
+        try:
+            conf_antiga = float(str(linha[COL_AVALIACAO_OUT]).replace(',', '.'))
+        except (ValueError, TypeError):
+            continue
+        if conf_antiga >= LIMIAR_RECLASSIFICACAO:
+            continue
+        texto = montar_texto_classificacao(linha)
+        if not texto or len(texto) < 5:
+            continue
+        cat_original = linha[COL_CATEGORIA_HIERARQUICA] if len(linha) > COL_CATEGORIA_HIERARQUICA else ''
+        candidatos.append({
+            'num_linha': i + 1,
+            'texto': texto,
+            'cat_original': cat_original,
+            'cat_atual': cat_atual,
+            'conf_antiga': conf_antiga
+        })
+        if len(candidatos) >= LOTE_RECLASSIFICACAO:
+            break
+
+    if not candidatos:
+        print("[Modo reclassificacao] Nenhum chamado elegível para reclassificação.")
+        return
+
+    print(f"[Modo reclassificacao] {len(candidatos)} candidato(s) com "
+          f"confiança < {LIMIAR_RECLASSIFICACAO}.")
+
+    celulas_update = []
+    n_alterados = 0
+    n_inalterados = 0
+    for c in candidatos:
+        nova_cat, nova_conf_pct = classificar_supervisionado(
+            pipeline, c['texto'], categorias_unicas
+        )
+        nova_conf = nova_conf_pct / 100.0
+        # Política de sobrescrita
+        sobrescrever = False
+        motivo = ''
+        if nova_cat == 'PENDENTE_REVISAO':
+            sobrescrever = False; motivo = 'nova_cat=PENDENTE_REVISAO'
+        elif nova_cat == c['cat_atual'] and nova_conf > c['conf_antiga'] + DELTA_MELHORIA_MINIMA:
+            sobrescrever = True; motivo = 'mesma cat, +confiança'
+        elif nova_cat != c['cat_atual'] and nova_conf >= LIMIAR_RECLASSIFICACAO:
+            sobrescrever = True; motivo = 'nova cat, alta confiança'
+        elif nova_conf > c['conf_antiga'] + DELTA_MELHORIA_MINIMA:
+            sobrescrever = True; motivo = 'melhoria forte'
+
+        if not sobrescrever:
+            n_inalterados += 1
+            continue
+
+        crit = estimar_criticidade(c['texto'])
+        executor = extrair_nome_executor(nome_origem)
+        num = c['num_linha']
+        celulas_update.append(gspread.Cell(num, COL_CAT_IA_OUT, nova_cat))
+        celulas_update.append(gspread.Cell(num, COL_AVALIACAO_OUT,
+                                           confianca_para_decimal(nova_conf_pct)))
+        celulas_update.append(gspread.Cell(num, COL_EXECUTOR_OUT, executor))
+        celulas_update.append(gspread.Cell(num, COL_CRITICIDADE_OUT, crit))
+        registrar_log(num, c['texto'], c['cat_original'], nova_cat,
+                      nova_conf_pct, crit, nome_origem,
+                      f"Reclass: {c['cat_atual']}→{nova_cat} "
+                      f"({c['conf_antiga']:.2f}→{nova_conf:.2f}) [{motivo}]")
+        n_alterados += 1
+
+    if celulas_update:
+        try:
+            planilha.update_cells(celulas_update, value_input_option='USER_ENTERED')
+            print(f"[Modo reclassificacao] {n_alterados} reclassificado(s), "
+                  f"{n_inalterados} mantido(s).")
+        except APIError as e:
+            print(f"[Modo reclassificacao] Erro ao gravar: {e}")
+    else:
+        print(f"[Modo reclassificacao] Nenhuma alteração: nenhum candidato "
+              f"melhorou o suficiente (>{DELTA_MELHORIA_MINIMA} ou mudança "
+              f"para nova cat ≥{LIMIAR_RECLASSIFICACAO}).")
+
+
 def _modo_ods():
     """[v4.0.4] Só indicadores ODS + aba PESOS_ODS."""
     try:
@@ -6167,6 +6313,8 @@ def iniciar_motor_operacional():
 
     if MODO == 'classificacao':
         return _modo_classificacao()
+    if MODO == 'reclassificacao':
+        return _modo_reclassificacao()
     if MODO == 'previsao_global':
         return _modo_previsao_global()
     if MODO == 'previsao_filtros':
@@ -6393,6 +6541,7 @@ if '--ciclo-unico' in _argv:
 # [v4.0.4] Flags de modo — dispatcher em iniciar_motor_operacional()
 _MODOS_CLI = {
     '--apenas-classificacao':    'classificacao',
+    '--apenas-reclassificacao':  'reclassificacao',
     '--apenas-previsao-global':  'previsao_global',
     '--apenas-previsao-filtros': 'previsao_filtros',
     '--apenas-ods':              'ods',
