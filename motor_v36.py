@@ -537,7 +537,15 @@ except ImportError:
     _SHAP_DISPONIVEL = False
     print("[Imports] SHAP indisponível — interpretabilidade do GBR ficará limitada.")
 
-# Versão única do motor (v4.0.3): usada em logs, METRICAS_TREINO e header.
+# Versão única do motor (v4.0.4): usada em logs, METRICAS_TREINO e header.
+# v4.0.4 (2026-05-14):
+#   - Suporte a execução por MODO via env var MOTOR_MODO ou flag CLI:
+#       * classificacao      → só LSTM + 1 lote (rápido, 15min)
+#       * previsao_global    → só previsão global (médio, 45min)
+#       * previsao_filtros   → só campus/tipo/categoria (pesado, 5h)
+#       * ods                → só indicadores + PESOS_ODS (rápido)
+#       * completo (default) → tudo (compatibilidade Colab/legado)
+#     Permite dividir em 4 workflows GitHub Actions com cadências distintas.
 # v4.0.3 (2026-05-14):
 #   - Previsão temporal de custos mensais (Coluna Q, "Valor do chamado") —
 #     série + parser preparados (Fase 4A). Refatoração de previsão para
@@ -548,7 +556,7 @@ except ImportError:
 #   - Detecção automática Colab vs. local; google.colab.drive opcional.
 #   - Imports do TensorFlow (Keras) elevados a escopo global para uso
 #     em treinar_classificador_lstm() fora da função _importar_tf().
-_VERSAO_MOTOR = "v4.0.3"
+_VERSAO_MOTOR = "v4.0.4"
 
 print(f"[Imports] OK · pandas={pd.__version__} · {_VERSAO_MOTOR} "
       f"(pmdarima={'ON' if _PMDARIMA_OK else 'fallback'}, "
@@ -5702,10 +5710,13 @@ def gravar_filtros_disponiveis(dados_linhas):
         print(f"[Filtros] Falha ao gravar FILTROS_DISPONIVEIS: {e}")
 
 
-def executar_todos_filtros(dados_linhas):
+def executar_todos_filtros(dados_linhas, executar_ods=True):
     """Roda executar_analise_preditiva_avancada para cada combinação de filtro e grava FILTROS_DISPONIVEIS.
 
     dados_linhas: lista de linhas SEM o cabeçalho (já vem assim do main loop).
+    executar_ods: se True (default, modo completo), grava também INDICADORES_ODS
+                  e PESOS_ODS ao final. Workflows separados (v4.0.4) podem
+                  passar False para deixar essas abas para outro workflow.
     O limiar mínimo para tentar rodar é MIN_REGISTROS_FILTRO chamados — a função
     interna descartará se os meses resultantes forem < MIN_PONTOS_SERIE.
     """
@@ -5840,12 +5851,15 @@ def executar_todos_filtros(dados_linhas):
             print(f"[Filtros] PREVISAO_POR_CATEGORIA falhou: {_e_pc}")
 
     # ── [v4.0.3 — Fase 4A] Indicadores ODS + Pesos ODS ──────────────────────
-    try:
-        print("[ODS] Calculando indicadores brutos por campus...")
-        calcular_indicadores_ods_por_campus(dados_linhas)
-        garantir_aba_pesos_ods()
-    except Exception as _e_ods:
-        print(f"[ODS] Bloco de indicadores/pesos falhou: {_e_ods}")
+    if executar_ods:
+        try:
+            print("[ODS] Calculando indicadores brutos por campus...")
+            calcular_indicadores_ods_por_campus(dados_linhas)
+            garantir_aba_pesos_ods()
+        except Exception as _e_ods:
+            print(f"[ODS] Bloco de indicadores/pesos falhou: {_e_ods}")
+    else:
+        print("[ODS] Pulado (workflow separado v4.0.4 — modo previsao_filtros).")
 
     print("[Filtros] Execução por filtros concluída.")
 
@@ -6019,12 +6033,147 @@ def chamar_llm_batch(itens, categorias_validas):
 # =====================================================================
 # 15. MOTOR PRINCIPAL
 # =====================================================================
+# =====================================================================
+# [v4.0.4] MODOS DE EXECUÇÃO ESPECIALIZADOS
+# Cada modo faz só uma parte do pipeline, viabilizando 4 workflows
+# GitHub Actions com cadências distintas.
+# =====================================================================
+def _modo_classificacao():
+    """[v4.0.4] Treina/carrega LSTM + processa 1 lote de 15 chamados. Rápido."""
+    LIMIAR_CONFIANCA = 70
+    LIMIAR_ALTA_CONFIANCA = 95.0
+    TAMANHO_LOTE = 15
+    try:
+        todas_linhas = planilha.get_all_values()
+    except APIError as e:
+        print(f"[Modo classificacao] Falha ao ler planilha: {e}")
+        return
+    dados_op = todas_linhas[1:]
+    atualizar_categorias(dados_op)
+    df_treino = carregar_dados_rotulados(dados_op)
+    pipeline, _ = (treinar_classificador_lstm(df_treino)
+                   if df_treino is not None else (None, None))
+    _eh_lstm = isinstance(pipeline, LSTMClassifier)
+    nome_origem_alta  = "Supervisionado_LSTM"            if _eh_lstm else "RF_Fallback"
+    nome_origem_baixa = "Supervisionado_LSTM_baixa_conf" if _eh_lstm else "RF_Fallback_baixa_conf"
+    print(f"[Modo classificacao] Classificador ativo: {'LSTM' if _eh_lstm else ('RF' if pipeline else 'NENHUM')}")
+
+    # Coleta lote de pendentes
+    lote = []
+    for i, linha in enumerate(todas_linhas):
+        if i == 0:
+            continue
+        cat_ia = linha[COL_CAT_IA].strip() if len(linha) > COL_CAT_IA else ""
+        if cat_ia == "":
+            texto = montar_texto_classificacao(linha)
+            if not texto:
+                continue
+            cat_orig = linha[COL_CATEGORIA_HIERARQUICA] if len(linha) > COL_CATEGORIA_HIERARQUICA else ""
+            lote.append({"num_linha": i + 1, "texto": texto, "cat_original": cat_orig})
+            if len(lote) >= TAMANHO_LOTE:
+                break
+
+    if not lote:
+        print("[Modo classificacao] Nenhum chamado pendente. Encerrando.")
+        return
+
+    for item in lote:
+        if pipeline is None:
+            item['cat_predita'] = item['cat_original'] or 'PENDENTE_REVISAO'
+            item['confianca'] = 0
+            item['origem'] = 'SemClassificador'
+            continue
+        cat, conf = classificar_supervisionado(pipeline, item['texto'], categorias_unicas)
+        if cat == "PENDENTE_REVISAO" or conf < LIMIAR_CONFIANCA:
+            item['cat_predita'] = item['cat_original'] or 'PENDENTE_REVISAO'
+            item['confianca'] = conf; item['origem'] = nome_origem_baixa
+        elif conf >= LIMIAR_ALTA_CONFIANCA:
+            item['cat_predita'] = cat
+            item['confianca'] = conf; item['origem'] = nome_origem_alta
+        else:
+            item['cat_predita'] = cat
+            item['confianca'] = conf; item['origem'] = nome_origem_baixa
+
+    celulas = []
+    for item in lote:
+        if item['cat_predita'] not in categorias_unicas and item['cat_predita'] != 'PENDENTE_REVISAO':
+            item['cat_predita'] = 'PENDENTE_REVISAO'
+        crit = estimar_criticidade(item['texto'])
+        executor = extrair_nome_executor(item['origem'])
+        num = item['num_linha']
+        celulas.append(gspread.Cell(num, COL_CAT_IA_OUT, item['cat_predita']))
+        celulas.append(gspread.Cell(num, COL_AVALIACAO_OUT, confianca_para_decimal(item['confianca'])))
+        celulas.append(gspread.Cell(num, COL_EXECUTOR_OUT, executor))
+        celulas.append(gspread.Cell(num, COL_CRITICIDADE_OUT, crit))
+        registrar_log(num, item['texto'], item['cat_original'], item['cat_predita'],
+                      item['confianca'], crit, item['origem'], "Processado")
+
+    try:
+        planilha.update_cells(celulas, value_input_option='USER_ENTERED')
+        print(f"[Modo classificacao] {len(lote)} chamados classificados e gravados.")
+    except APIError as e:
+        print(f"[Modo classificacao] Erro ao gravar: {e}")
+
+
+def _modo_previsao_global():
+    """[v4.0.4] Só previsão global. Sem filtros. Sem ODS."""
+    try:
+        todas_linhas = planilha.get_all_values()
+    except APIError as e:
+        print(f"[Modo previsao_global] Falha: {e}"); return
+    dados_op = todas_linhas[1:]
+    atualizar_categorias(dados_op)
+    executar_analise_preditiva_avancada(dados_op, sufixo="")
+
+
+def _modo_previsao_filtros():
+    """[v4.0.4] Só filtros (campus/tipo/categoria). Sem global. Sem ODS."""
+    try:
+        todas_linhas = planilha.get_all_values()
+    except APIError as e:
+        print(f"[Modo previsao_filtros] Falha: {e}"); return
+    dados_op = todas_linhas[1:]
+    atualizar_categorias(dados_op)
+    executar_todos_filtros(dados_op, executar_ods=False)
+
+
+def _modo_ods():
+    """[v4.0.4] Só indicadores ODS + aba PESOS_ODS."""
+    try:
+        todas_linhas = planilha.get_all_values()
+    except APIError as e:
+        print(f"[Modo ods] Falha: {e}"); return
+    dados_op = todas_linhas[1:]
+    atualizar_categorias(dados_op)
+    try:
+        print("[ODS] Calculando indicadores brutos por campus...")
+        calcular_indicadores_ods_por_campus(dados_op)
+        garantir_aba_pesos_ods()
+    except Exception as e:
+        print(f"[Modo ods] Falha: {e}")
+
+
 def iniciar_motor_operacional():
     print("=" * 70)
     print(f"MOTOR DE GOVERNANÇA PREDITIVA — {_VERSAO_MOTOR}")
     print("Classificação 100% LOCAL: LSTM Bidirecional (fallback RF)")
     print("APIs externas de LLM: REMOVIDAS")
     print("=" * 70)
+
+    # [v4.0.4] Dispatcher por modo de execução
+    MODO = os.environ.get('MOTOR_MODO', 'completo').strip().lower()
+    print(f"[Motor] MODO = {MODO}")
+    rotacionar_logs_se_necessario()
+
+    if MODO == 'classificacao':
+        return _modo_classificacao()
+    if MODO == 'previsao_global':
+        return _modo_previsao_global()
+    if MODO == 'previsao_filtros':
+        return _modo_previsao_filtros()
+    if MODO == 'ods':
+        return _modo_ods()
+    # MODO == 'completo' → comportamento existente (Colab/legado)
 
     TAMANHO_LOTE = 15
     LIMIAR_CONFIANCA = 70
@@ -6046,8 +6195,7 @@ def iniciar_motor_operacional():
     pipeline_supervisionado = None
     contador_ciclos = 0
 
-    # G10: rotaciona logs antigos uma vez no boot
-    rotacionar_logs_se_necessario()
+    # G10: rotação de logs já feita pelo dispatcher (v4.0.4)
 
     try:
         primeiras = planilha.get_all_values()
@@ -6236,8 +6384,24 @@ def iniciar_motor_operacional():
 #       MOTOR_MAX_CICLOS=3 python motor_v36.py   (processa 3 lotes e sai)
 # =====================================================================
 import sys as _sys_entry
-if '--ciclo-unico' in _sys_entry.argv:
+_argv = _sys_entry.argv
+
+if '--ciclo-unico' in _argv:
     os.environ['MOTOR_MAX_CICLOS'] = '1'
     print("[Entry] Flag --ciclo-unico detectada → MOTOR_MAX_CICLOS=1")
+
+# [v4.0.4] Flags de modo — dispatcher em iniciar_motor_operacional()
+_MODOS_CLI = {
+    '--apenas-classificacao':    'classificacao',
+    '--apenas-previsao-global':  'previsao_global',
+    '--apenas-previsao-filtros': 'previsao_filtros',
+    '--apenas-ods':              'ods',
+}
+for _flag, _modo in _MODOS_CLI.items():
+    if _flag in _argv:
+        os.environ['MOTOR_MODO'] = _modo
+        os.environ['MOTOR_MAX_CICLOS'] = '1'
+        print(f"[Entry] Flag {_flag} → MOTOR_MODO={_modo}")
+        break
 
 iniciar_motor_operacional()
